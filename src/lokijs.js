@@ -4234,7 +4234,7 @@
           var len = key.length;
           var res = new Array(len);
           while (len--) {
-            res[len] = joinMap[len];
+            res[len] = joinMap[key[len]];
           }
           result.push(mapFun(leftData[j], res || []));
         } else {
