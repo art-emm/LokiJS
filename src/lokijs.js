@@ -780,18 +780,20 @@
      */
     LokiEventEmitter.prototype.emit = function (eventName) {
       var self = this;
-      var selfArgs = Array.prototype.slice.call(arguments, 1);
+      var selfArgs;
       if (eventName && this.events[eventName]) {
-        this.events[eventName].forEach(function (listener) {
-          if (self.asyncListeners) {
-            setTimeout(function () {
+        if (this.events[eventName].length) {
+          selfArgs = Array.prototype.slice.call(arguments, 1);
+          this.events[eventName].forEach(function (listener) {
+            if (self.asyncListeners) {
+              setTimeout(function () {
+                listener.apply(self, selfArgs);
+              }, 1);
+            } else {
               listener.apply(self, selfArgs);
-            }, 1);
-          } else {
-            listener.apply(self, selfArgs);
-          }
-
-        });
+            }
+          });
+        }
       } else {
         throw new Error('No event ' + eventName + ' defined');
       }
@@ -1009,6 +1011,9 @@
           this.persistenceMethod = 'adapter';
           this.persistenceAdapter = options.adapter;
           this.options.adapter = null;
+
+          // if true, will keep track of dirty ids
+          this.isIncremental = this.persistenceAdapter.mode === 'incremental';
         }
 
 
@@ -1136,10 +1141,11 @@
       }
 
       var collection = new Collection(name, options);
+      collection.isIncremental = this.isIncremental;
       this.collections.push(collection);
 
       if (this.verbose)
-        collection.console = console;
+        collection.lokiConsoleWrapper = console;
 
       return collection;
     };
@@ -1251,6 +1257,8 @@
       case 'throttledSavePending':
       case 'throttledCallbacks':
         return undefined;
+      case 'lokiConsoleWrapper':
+        return null;
       default:
         return value;
       }
@@ -1692,7 +1700,11 @@
       for (i; i < len; i += 1) {
         coll = dbObject.collections[i];
 
-        copyColl = this.addCollection(coll.name, { disableChangesApi: coll.disableChangesApi, disableDeltaChangesApi: coll.disableDeltaChangesApi, disableMeta: coll.disableMeta });
+        copyColl = this.addCollection(coll.name, {
+          disableChangesApi: coll.disableChangesApi,
+          disableDeltaChangesApi: coll.disableDeltaChangesApi,
+          disableMeta: coll.disableMeta
+        });
 
         copyColl.adaptiveBinaryIndices = coll.hasOwnProperty('adaptiveBinaryIndices')?(coll.adaptiveBinaryIndices === true): false;
         copyColl.transactional = coll.transactional;
@@ -1701,6 +1713,7 @@
         copyColl.cloneMethod = coll.cloneMethod || "parse-stringify";
         copyColl.autoupdate = coll.autoupdate;
         copyColl.changes = coll.changes;
+        copyColl.dirtyIds = coll.dirtyIds || [];
 
         if (options && options.retainDirtyFlags === true) {
           copyColl.dirty = coll.dirty;
@@ -2643,30 +2656,58 @@
             throw err;
           }
           return;
-        },
-        self = this;
+        };
+      var self = this;
 
       // the persistenceAdapter should be present if all is ok, but check to be sure.
-      if (this.persistenceAdapter !== null) {
-        // check if the adapter is requesting (and supports) a 'reference' mode export
-        if (this.persistenceAdapter.mode === "reference" && typeof this.persistenceAdapter.exportDatabase === "function") {
-          // filename may seem redundant but loadDatabase will need to expect this same filename
-          this.persistenceAdapter.exportDatabase(this.filename, this.copy({removeNonSerializable:true}), function exportDatabaseCallback(err) {
-            self.autosaveClearFlags();
-            cFun(err);
-          });
-        }
-        // otherwise just pass the serialized database to adapter
-        else {
-          // persistenceAdapter might be asynchronous, so we must clear `dirty` immediately
-          // or autosave won't work if an update occurs between here and the callback
-          self.autosaveClearFlags();
-          this.persistenceAdapter.saveDatabase(this.filename, self.serialize(), function saveDatabasecallback(err) {
-            cFun(err);
-          });
-        }
-      } else {
+      if (!this.persistenceAdapter) {
         cFun(new Error('persistenceAdapter not configured'));
+        return;
+      }
+
+      // persistenceAdapter might be asynchronous, so we must clear `dirty` immediately
+      // or autosave won't work if an update occurs between here and the callback
+      // TODO: This should be stored and rolled back in case of DB save failure
+      // TODO: Reference mode adapter should have the same behavior
+      if (this.persistenceAdapter.mode !== "reference") {
+        this.autosaveClearFlags();
+      }
+
+      // run incremental, reference, or normal mode adapters, depending on what's available
+      if (this.persistenceAdapter.mode === "incremental") {
+        var lokiCopy = this.copy({removeNonSerializable:true});
+
+        // remember and clear dirty ids -- we must do it before the save so that if
+        // and update occurs between here and callback, it will get saved later
+        var cachedDirtyIds = this.collections.map(function (collection) {
+          return collection.dirtyIds;
+        });
+        this.collections.forEach(function (col) {
+          col.dirtyIds = [];
+        });
+
+        this.persistenceAdapter.saveDatabase(this.filename, lokiCopy, function exportDatabaseCallback(err) {
+          if (err) {
+            // roll back dirty IDs to be saved later
+            self.collections.forEach(function (col, i) {
+              col.dirtyIds = col.dirtyIds.concat(cachedDirtyIds[i]);
+            });
+          }
+          cFun(err);
+        });
+
+      } else if (this.persistenceAdapter.mode === "reference" && typeof this.persistenceAdapter.exportDatabase === "function") {
+        // filename may seem redundant but loadDatabase will need to expect this same filename
+        this.persistenceAdapter.exportDatabase(this.filename, this.copy({removeNonSerializable:true}), function exportDatabaseCallback(err) {
+          self.autosaveClearFlags();
+          cFun(err);
+        });
+      }
+      // otherwise just pass the serialized database to adapter
+      else {
+        this.persistenceAdapter.saveDatabase(this.filename, this.serialize(), function saveDatabasecallback(err) {
+          cFun(err);
+        });
       }
     };
 
@@ -3268,10 +3309,6 @@
         // we need to branch existing query to run each filter separately and combine results
         fr = this.branch().find(expressionArray[ei]).filteredrows;
         frlen = fr.length;
-        // if the find operation did not reduce the initial set, then the initial set is the actual result
-        if (frlen === origCount) {
-          return this;
-        }
 
         // add any document 'hits'
         for (fri = 0; fri < frlen; fri++) {
@@ -4897,6 +4934,9 @@
       // changes are tracked by collection and aggregated by the db
       this.changes = [];
 
+      // lightweight changes tracking (loki IDs only) for optimized db saving
+      this.dirtyIds = [];
+
       // initialize the id index
       this.ensureId();
       var indices = [];
@@ -5003,7 +5043,7 @@
       });
 
       this.on('warning', function (warning) {
-        self.console.warn(warning);
+        self.lokiConsoleWrapper.warn(warning);
       });
       // for de-serialization purposes
       flushChanges();
@@ -5080,7 +5120,7 @@
       this.createUpdateChange(obj, old);
     };
 
-    Collection.prototype.console = {
+    Collection.prototype.lokiConsoleWrapper = {
       log: function () {},
       warn: function () {},
       error: function () {},
@@ -5278,12 +5318,12 @@
 
       var wrappedComparer =
         (function (prop, data) {
-          var val1, val2, arr;
+          var val1, val2;
+          var propPath = ~prop.indexOf('.') ? prop.split('.') : false;
           return function (a, b) {
-            if (~prop.indexOf('.')) {
-              arr = prop.split('.');
-              val1 = Utils.getIn(data[a], arr, true);
-              val2 = Utils.getIn(data[b], arr, true);
+            if (propPath) {
+              val1 = Utils.getIn(data[a], propPath, true);
+              val2 = Utils.getIn(data[b], propPath, true);
             } else {
               val1 = data[a][prop];
               val2 = data[b][prop];
@@ -5631,6 +5671,9 @@
     /**
      * Adds object(s) to collection, ensure object(s) have meta properties, clone it if necessary, etc.
      * @param {(object|array)} doc - the document (or array of documents) to be inserted
+     * @param {boolean=} overrideAdaptiveIndices - (optional) if `true`, adaptive indicies will be
+     *   temporarily disabled and then fully rebuilt after batch. This will be faster for
+     *   large inserts, but slower for small/medium inserts in large collections
      * @returns {(object|array)} document or documents inserted
      * @memberof Collection
      * @example
@@ -5643,7 +5686,7 @@
      * // alternatively, insert array of documents
      * users.insert([{ name: 'Thor', age: 35}, { name: 'Loki', age: 30}]);
      */
-    Collection.prototype.insert = function (doc) {
+    Collection.prototype.insert = function (doc, overrideAdaptiveIndices) {
       if (!Array.isArray(doc)) {
         return this.insertOne(doc);
       }
@@ -5652,13 +5695,29 @@
       var obj;
       var results = [];
 
-      this.emit('pre-insert', doc);
-      for (var i = 0, len = doc.length; i < len; i++) {
-        obj = this.insertOne(doc[i], true);
-        if (!obj) {
-          return undefined;
+      // if not cloning, disable adaptive binary indices for the duration of the batch insert,
+      // followed by lazy rebuild and re-enabling adaptive indices after batch insert.
+      var adaptiveBatchOverride = overrideAdaptiveIndices && !this.cloneObjects &&
+        this.adaptiveBinaryIndices && Object.keys(this.binaryIndices).length > 0;
+
+      if (adaptiveBatchOverride) {
+        this.adaptiveBinaryIndices = false;
+      }
+
+      try {
+        this.emit('pre-insert', doc);
+        for (var i = 0, len = doc.length; i < len; i++) {
+          obj = this.insertOne(doc[i], true);
+          if (!obj) {
+            return undefined;
+          }
+          results.push(obj);
         }
-        results.push(obj);
+      } finally {
+        if (adaptiveBatchOverride) {
+          this.ensureAllIndexes();
+          this.adaptiveBinaryIndices = true;
+        }
       }
 
       // at the 'batch' level, if clone option is true then emitted docs are clones
@@ -5872,6 +5931,10 @@
         this.idIndex[position] = newInternal.$loki;
         //this.flagBinaryIndexesDirty();
 
+        if (this.isIncremental) {
+          this.dirtyIds.push(newInternal.$loki);
+        }
+
         this.commit();
         this.dirty = true; // for autosave scenarios
 
@@ -5897,7 +5960,7 @@
         return returnObj;
       } catch (err) {
         this.rollback();
-        this.console.error(err.message);
+        this.lokiConsoleWrapper.error(err.message);
         this.emit('error', err);
         throw (err); // re-throw error so user does not think it succeeded
       }
@@ -5944,6 +6007,9 @@
 
         // add new obj id to idIndex
         this.idIndex.push(obj.$loki);
+        if (this.isIncremental) {
+          this.dirtyIds.push(obj.$loki);
+        }
 
         // add the object
         this.data.push(obj);
@@ -5974,7 +6040,7 @@
         return (this.cloneObjects) ? (clone(obj, this.cloneMethod)) : (obj);
       } catch (err) {
         this.rollback();
-        this.console.error(err.message);
+        this.lokiConsoleWrapper.error(err.message);
         this.emit('error', err);
         throw (err); // re-throw error so user does not think it succeeded
       }
@@ -5999,7 +6065,7 @@
 
       } catch (err) {
         this.rollback();
-        this.console.error(err.message);
+        this.lokiConsoleWrapper.error(err.message);
       }
     };
 
@@ -6118,7 +6184,7 @@
         if (adaptiveOverride) {
           this.adaptiveBinaryIndices = true;
         }
-        this.console.error(err.message);
+        this.lokiConsoleWrapper.error(err.message);
         this.emit('error', err);
         return null;
       }
@@ -6209,6 +6275,10 @@
         // remove id from idIndex
         this.idIndex.splice(position, 1);
 
+        if (this.isIncremental) {
+          this.dirtyIds.push(doc.$loki);
+        }
+
         this.commit();
         this.dirty = true; // for autosave scenarios
         this.emit('delete', arr[0]);
@@ -6218,7 +6288,7 @@
 
       } catch (err) {
         this.rollback();
-        this.console.error(err.message);
+        this.lokiConsoleWrapper.error(err.message);
         this.emit('error', err);
         return null;
       }
@@ -6834,6 +6904,7 @@
         this.cachedData = clone(this.data, this.cloneMethod);
         this.cachedIndex = this.idIndex;
         this.cachedBinaryIndex = this.binaryIndices;
+        this.cachedDirtyIds = this.dirtyIds;
 
         // propagate startTransaction to dynamic views
         for (var idx = 0; idx < this.DynamicViews.length; idx++) {
@@ -6848,6 +6919,7 @@
         this.cachedData = null;
         this.cachedIndex = null;
         this.cachedBinaryIndex = null;
+        this.cachedDirtyIds = null;
 
         // propagate commit to dynamic views
         for (var idx = 0; idx < this.DynamicViews.length; idx++) {
@@ -6863,6 +6935,7 @@
           this.data = this.cachedData;
           this.idIndex = this.cachedIndex;
           this.binaryIndices = this.cachedBinaryIndex;
+          this.dirtyIds = this.cachedDirtyIds;
         }
 
         // propagate rollback to dynamic views
